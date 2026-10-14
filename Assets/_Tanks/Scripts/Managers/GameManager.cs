@@ -1,357 +1,406 @@
 using System.Collections;
-using TMPro;
+using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.SceneManagement;
-using UnityEngine.Serialization;
+using UnityEngine.UI;
 
 namespace Tanks.Complete
 {
+    /// <summary>
+    /// Open World Biome Sandbox GameManager для Unity 6.
+    /// Полностью переписан под режим единого открытого мира:
+    /// 1. Авто-старт минуя MainMenuCanvas / Menus.
+    /// 2. Игрок 0 = Синий ATV (человек), Индексы 1..3 = Боты биомов.
+    /// 3. Камера зафиксирована строго на трансформе игрока 0 (без отдаления).
+    /// 4. Бесконечная корутина SandboxLoop с локальным возрождением через 3 секунды.
+    /// </summary>
     public class GameManager : MonoBehaviour
     {
-        // Which state the game is currently in
-        public enum GameState
+        /// <summary>
+        /// Вложенный тип PlayerData, ожидаемый GameUIHandler.cs и остальными системами Tanks.
+        /// </summary>
+        [System.Serializable]
+        public struct PlayerData
         {
-            MainMenu,
-            Game
+            public Color m_PlayerColor;
+            public Transform m_SpawnPoint;
+            public int m_PlayerNumber;
+            public GameObject m_TankPrefab;
+            public bool m_IsComputer;
+            public int m_ControlIndex;
+
+            // Свойства-алиасы для максимальной совместимости
+            public GameObject tankPrefab { get => m_TankPrefab; set => m_TankPrefab = value; }
+            public bool IsComputer { get => m_IsComputer; set => m_IsComputer = value; }
+            public bool isComputer { get => m_IsComputer; set => m_IsComputer = value; }
+            public int ControlIndex { get => m_ControlIndex; set => m_ControlIndex = value; }
+            public int controlIndex { get => m_ControlIndex; set => m_ControlIndex = value; }
+            public Color playerColor { get => m_PlayerColor; set => m_PlayerColor = value; }
+            public int playerNumber { get => m_PlayerNumber; set => m_PlayerNumber = value; }
+            public Transform spawnPoint { get => m_SpawnPoint; set => m_SpawnPoint = value; }
         }
 
-        // Data about the selected tanks passed from the menu to the GameManager
-        public class PlayerData
-        {
-            public bool IsComputer;
-            public Color TankColor;
-            public GameObject UsedPrefab;
-            public int ControlIndex;
-        }
-        
-        public int m_NumRoundsToWin = 5;            // The number of rounds a single player has to win to win the game.
-        public float m_StartDelay = 3f;             // The delay between the start of RoundStarting and RoundPlaying phases.
-        public float m_EndDelay = 3f;               // The delay between the end of RoundPlaying and RoundEnding phases.
-        public CameraControl m_CameraControl;       // Reference to the CameraControl script for control during different phases.
+        [Header("Camera & UI")]
+        public CameraControl m_CameraControl;
+        public Text m_MessageText;
+        public GameObject m_MainMenuCanvas;
+        public GameObject m_Menus;
 
-        [Header("Tanks Prefabs")]
-        public GameObject m_Tank1Prefab;            // The Prefab used by the tank in Slot 1 of the Menu
-        public GameObject m_Tank2Prefab;            // The Prefab used by the tank in Slot 2 of the Menu
-        public GameObject m_Tank3Prefab;            // The Prefab used by the tank in Slot 3 of the Menu
-        public GameObject m_Tank4Prefab;            // The Prefab used by the tank in Slot 4 of the Menu
-        
-        [FormerlySerializedAs("m_Tanks")] 
-        public TankManager[] m_SpawnPoints;         // A collection of managers for enabling and disabling different aspects of the tanks.
-        
-        private GameState m_CurrentState;
-        
-        private int m_RoundNumber;                  // Which round the game is currently on.
-        private WaitForSeconds m_StartWait;         // Used to have a delay whilst the round starts.
-        private WaitForSeconds m_EndWait;           // Used to have a delay whilst the round or game ends.
-        private TankManager m_RoundWinner;          // Reference to the winner of the current round.  Used to make an announcement of who won.
-        private TankManager m_GameWinner;           // Reference to the winner of the game.  Used to make an announcement of who won.
+        [Header("Tank Prefabs (Player & Biomes)")]
+        [Tooltip("Индекс 0: Танк игрока (Синий ATV)")]
+        public GameObject m_Tank1Prefab;
+        [Tooltip("Индекс 1: Бот Биома 1")]
+        public GameObject m_Tank2Prefab;
+        [Tooltip("Индекс 2: Бот Биома 2")]
+        public GameObject m_Tank3Prefab;
+        [Tooltip("Индекс 3: Бот Биома 3")]
+        public GameObject m_Tank4Prefab;
 
-        private PlayerData[] m_TankData;            // Data passed from the menu about each selected tank (at least 2, max 4)
-        private int m_PlayerCount = 0;              // The number of players (2 to 4), decided from the number of PlayerData passed by the menu
-        private TextMeshProUGUI m_TitleText;        // The text used to display game message. Automatically found as part of the Menu prefab
+        [Tooltip("Резервный префаб на случай отсутствия индивидуальных префабов")]
+        public GameObject m_TankPrefab;
+
+        [Header("Spawn Points / Tank Managers")]
+        public TankManager[] m_SpawnPoints;
+
+        // Свойства обратной совместимости для GameUIHandler и других скриптов проекта
+        public TankManager[] m_Tanks { get => m_SpawnPoints; set => m_SpawnPoints = value; }
+        public int m_NumRoundsToWin = 5;
+        public float m_StartDelay = 3f;
+        public float m_EndDelay = 3f;
+        public int m_RoundNumber = 1;
+
+        [Header("Active Player Setup")]
+        public PlayerData[] m_PlayerData;
+
+        // Защита от запуска параллельных корутин возрождения одного и того же танка
+        private readonly HashSet<int> m_RespawningTanks = new HashSet<int>();
+        private Coroutine m_SandboxCoroutine;
 
         private void Start()
         {
-            m_CurrentState = GameState.MainMenu;
+            // 1. Авто-старт: автоматически находим и отключаем MainMenuCanvas или Menus
+            DisableMenuCanvases();
 
-            // Find the text used to display game info. Need to look at inactive object too, as the Menu prefab (which contains it) may be
-            // disabled at the start when the user have a Title Screen which will enable the Menu.
-            var textRef = FindAnyObjectByType<MessageTextReference>(FindObjectsInactive.Include);
+            // 2. Формируем массив PlayerData[] из 4 элементов с фиксированными ролями
+            PlayerData[] players = CreateFixedPlayersData();
 
-            // If that text couldn't be found, we display an error and exit as it is required for the game manager to work
-            if (textRef == null)
+            // 3. Мгновенно запускаем игру минуя меню выбора
+            StartGame(players);
+        }
+
+        /// <summary>
+        /// Правило 1: Автоматически находит и отключает меню.
+        /// </summary>
+        private void DisableMenuCanvases()
+        {
+            if (m_MainMenuCanvas != null)
             {
-                Debug.LogError("You need to add the Menus prefab in the scene to use the GameManager!");
-                return;
+                m_MainMenuCanvas.SetActive(false);
             }
 
-            m_TitleText = textRef.Text;
-            m_TitleText.text = "";
-
-            // The GameManager require 4 tanks prefabs, as the start menu have 4 fixed slot and need the 4 tanks to show there
-            if (m_Tank1Prefab == null || m_Tank2Prefab == null || m_Tank3Prefab == null || m_Tank4Prefab == null)
+            if (m_Menus != null)
             {
-                Debug.LogError("You need to assign 4 tank prefab in the GameManager!");
+                m_Menus.SetActive(false);
+            }
+
+            GameObject foundMainMenu = GameObject.Find("MainMenuCanvas");
+            if (foundMainMenu != null)
+            {
+                foundMainMenu.SetActive(false);
+            }
+
+            GameObject foundMenus = GameObject.Find("Menus");
+            if (foundMenus != null)
+            {
+                foundMenus.SetActive(false);
+            }
+
+            #if UNITY_2023_1_OR_NEWER || UNITY_6000_0_OR_NEWER
+            Canvas[] canvases = Object.FindObjectsByType<Canvas>(FindObjectsSortMode.None);
+            #else
+            Canvas[] canvases = Object.FindObjectsOfType<Canvas>();
+            #endif
+
+            foreach (Canvas c in canvases)
+            {
+                if (c != null && c.gameObject != null)
+                {
+                    string lower = c.gameObject.name.ToLower();
+                    if (lower.Contains("mainmenu") || lower.Equals("menus") || lower.Contains("menu canvas"))
+                    {
+                        c.gameObject.SetActive(false);
+                    }
+                }
             }
         }
 
-        void GameStart()
+        /// <summary>
+        /// Правило 2: Фиксация ролей:
+        /// Индекс 0: Игрок, m_Tank1Prefab, IsComputer = false, ControlIndex = 1
+        /// Индексы 1..3: Боты с m_Tank2Prefab, m_Tank3Prefab, m_Tank4Prefab, IsComputer = true, ControlIndex = -1
+        /// </summary>
+        public PlayerData[] CreateFixedPlayersData()
         {
-            // Create the delays so they only have to be made once.
-            m_StartWait = new WaitForSeconds (m_StartDelay);
-            m_EndWait = new WaitForSeconds (m_EndDelay);
+            PlayerData[] players = new PlayerData[4];
+
+            // Индекс 0: Игрок (Синий ATV)
+            players[0] = new PlayerData
+            {
+                m_TankPrefab = m_Tank1Prefab != null ? m_Tank1Prefab : m_TankPrefab,
+                IsComputer = false,
+                ControlIndex = 1,
+                m_PlayerNumber = 1,
+                m_PlayerColor = new Color(0.18f, 0.44f, 1.0f),
+                m_SpawnPoint = (m_SpawnPoints != null && m_SpawnPoints.Length > 0 && m_SpawnPoints[0] != null) ? m_SpawnPoints[0].m_SpawnPoint : null
+            };
+
+            // Индекс 1: Бот 1
+            players[1] = new PlayerData
+            {
+                m_TankPrefab = m_Tank2Prefab != null ? m_Tank2Prefab : m_TankPrefab,
+                IsComputer = true,
+                ControlIndex = -1,
+                m_PlayerNumber = 2,
+                m_PlayerColor = new Color(0.9f, 0.15f, 0.15f),
+                m_SpawnPoint = (m_SpawnPoints != null && m_SpawnPoints.Length > 1 && m_SpawnPoints[1] != null) ? m_SpawnPoints[1].m_SpawnPoint : null
+            };
+
+            // Индекс 2: Бот 2
+            players[2] = new PlayerData
+            {
+                m_TankPrefab = m_Tank3Prefab != null ? m_Tank3Prefab : m_TankPrefab,
+                IsComputer = true,
+                ControlIndex = -1,
+                m_PlayerNumber = 3,
+                m_PlayerColor = new Color(0.15f, 0.85f, 0.25f),
+                m_SpawnPoint = (m_SpawnPoints != null && m_SpawnPoints.Length > 2 && m_SpawnPoints[2] != null) ? m_SpawnPoints[2].m_SpawnPoint : null
+            };
+
+            // Индекс 3: Бот 3
+            players[3] = new PlayerData
+            {
+                m_TankPrefab = m_Tank4Prefab != null ? m_Tank4Prefab : m_TankPrefab,
+                IsComputer = true,
+                ControlIndex = -1,
+                m_PlayerNumber = 4,
+                m_PlayerColor = new Color(0.95f, 0.75f, 0.1f),
+                m_SpawnPoint = (m_SpawnPoints != null && m_SpawnPoints.Length > 3 && m_SpawnPoints[3] != null) ? m_SpawnPoints[3].m_SpawnPoint : null
+            };
+
+            return players;
+        }
+
+        public void StartGame(PlayerData[] players)
+        {
+            m_PlayerData = players;
+            StartGame();
+        }
+
+        public void StartGame()
+        {
+            if (m_PlayerData == null || m_PlayerData.Length < 4)
+            {
+                m_PlayerData = CreateFixedPlayersData();
+            }
 
             SpawnAllTanks();
             SetCameraTargets();
 
-            // Once the tanks have been created and the camera is using them as targets, start the game.
-            StartCoroutine (GameLoop ());
-        }
-
-        void ChangeGameState(GameState newState)
-        {
-            m_CurrentState = newState;
-
-            switch (m_CurrentState)
+            if (m_SandboxCoroutine != null)
             {
-                case GameState.Game:
-                    GameStart();
-                    break;
+                StopCoroutine(m_SandboxCoroutine);
             }
+            m_SandboxCoroutine = StartCoroutine(SandboxLoop());
         }
 
-        // Called by the menu, passing along the data from the selection made by the player in the menu
-        public void StartGame(PlayerData[] playerData)
-        {
-            m_TankData = playerData;
-            m_PlayerCount = m_TankData.Length;
-            ChangeGameState(GameState.Game);
-        }
-
-
+        /// <summary>
+        /// Спавнит все 4 танка и вызывает TankManager.Setup(this).
+        /// </summary>
         private void SpawnAllTanks()
         {
-            // For all the tanks...
-            for (int i = 0; i < m_PlayerCount; i++)
-            {
-                var playerData = m_TankData[i];
-                
-                // ... create them, set their player number and references needed for control.
-                m_SpawnPoints[i].m_Instance =
-                    Instantiate(playerData.UsedPrefab, m_SpawnPoints[i].m_SpawnPoint.position, m_SpawnPoints[i].m_SpawnPoint.rotation) as GameObject;
+            if (m_SpawnPoints == null) return;
 
-                //this guard against possible user error : if they created a prefab with Is Computer Control set to true
-                //then all of those prefab would be bots. So we ensure it's to false (the IsComputer from player data
-                //will re-enable this if needed when the game start)
-                var mov = m_SpawnPoints[i].m_Instance.GetComponent<TankMovement>();
-                mov.m_IsComputerControlled = false;
-                
-                m_SpawnPoints[i].m_PlayerNumber = i + 1;
-                m_SpawnPoints[i].ControlIndex = playerData.ControlIndex;
-                m_SpawnPoints[i].m_PlayerColor = playerData.TankColor;
-                m_SpawnPoints[i].m_ComputerControlled = playerData.IsComputer;
-            }
-
-            //we delayed setup after all tanks are created as they expect to have access to all other tanks in the manager
-            foreach (var tank in m_SpawnPoints)
+            for (int i = 0; i < m_SpawnPoints.Length; i++)
             {
-                if(tank.m_Instance == null)
-                    continue;
-                
-                tank.Setup(this);
+                if (m_SpawnPoints[i] == null) continue;
+
+                GameObject prefabToSpawn = GetTankPrefab(i);
+
+                if (prefabToSpawn != null && m_SpawnPoints[i].m_SpawnPoint != null)
+                {
+                    if (m_SpawnPoints[i].m_Instance != null)
+                    {
+                        Destroy(m_SpawnPoints[i].m_Instance);
+                    }
+
+                    m_SpawnPoints[i].m_Instance = Instantiate(
+                        prefabToSpawn,
+                        m_SpawnPoints[i].m_SpawnPoint.position,
+                        m_SpawnPoints[i].m_SpawnPoint.rotation
+                    );
+
+                    m_SpawnPoints[i].m_PlayerNumber = i + 1;
+
+                    if (m_PlayerData != null && i < m_PlayerData.Length)
+                    {
+                        SyncTankManagerData(m_SpawnPoints[i], m_PlayerData[i]);
+                    }
+
+                    // Исправление CS7036: передаем 'this' (GameManager) в Setup
+                    m_SpawnPoints[i].Setup(this);
+                }
             }
         }
 
+        private GameObject GetTankPrefab(int index)
+        {
+            if (m_PlayerData != null && index < m_PlayerData.Length && m_PlayerData[index].m_TankPrefab != null)
+            {
+                return m_PlayerData[index].m_TankPrefab;
+            }
 
+            switch (index)
+            {
+                case 0: return m_Tank1Prefab != null ? m_Tank1Prefab : m_TankPrefab;
+                case 1: return m_Tank2Prefab != null ? m_Tank2Prefab : m_TankPrefab;
+                case 2: return m_Tank3Prefab != null ? m_Tank3Prefab : m_TankPrefab;
+                case 3: return m_Tank4Prefab != null ? m_Tank4Prefab : m_TankPrefab;
+                default: return m_TankPrefab;
+            }
+        }
+
+        private void SyncTankManagerData(TankManager tankManager, PlayerData data)
+        {
+            if (tankManager == null) return;
+
+            tankManager.m_PlayerColor = data.m_PlayerColor;
+            tankManager.m_PlayerNumber = data.m_PlayerNumber;
+
+            var type = typeof(TankManager);
+
+            // IsComputer
+            var isCompField = type.GetField("m_IsComputer") ?? type.GetField("IsComputer") ?? type.GetField("isComputer");
+            if (isCompField != null) isCompField.SetValue(tankManager, data.IsComputer);
+            var isCompProp = type.GetProperty("IsComputer") ?? type.GetProperty("isComputer");
+            if (isCompProp != null && isCompProp.CanWrite) isCompProp.SetValue(tankManager, data.IsComputer);
+
+            // ControlIndex
+            var ctrlField = type.GetField("m_ControlIndex") ?? type.GetField("ControlIndex") ?? type.GetField("controlIndex");
+            if (ctrlField != null) ctrlField.SetValue(tankManager, data.ControlIndex);
+            var ctrlProp = type.GetProperty("ControlIndex") ?? type.GetProperty("controlIndex");
+            if (ctrlProp != null && ctrlProp.CanWrite) ctrlProp.SetValue(tankManager, data.ControlIndex);
+        }
+
+        /// <summary>
+        /// Правило 3: Камера держит в качестве цели ТОЛЬКО танк игрока (индекс 0).
+        /// </summary>
         private void SetCameraTargets()
         {
-            // Create a collection of transforms the same size as the number of tanks.
-            Transform[] targets = new Transform[m_PlayerCount];
+            if (m_CameraControl == null) return;
 
-            // For each of these transforms...
-            for (int i = 0; i < targets.Length; i++)
+            if (m_SpawnPoints != null && m_SpawnPoints.Length > 0 && m_SpawnPoints[0] != null && m_SpawnPoints[0].m_Instance != null)
             {
-                // ... set it to the appropriate tank transform.
-                targets[i] = m_SpawnPoints[i].m_Instance.transform;
-            }
-
-            // These are the targets the camera should follow.
-            m_CameraControl.m_Targets = targets;
-        }
-
-
-        // This is called from start and will run each phase of the game one after another.
-        private IEnumerator GameLoop ()
-        {
-            // Start off by running the 'RoundStarting' coroutine but don't return until it's finished.
-            yield return StartCoroutine (RoundStarting ());
-
-            // Once the 'RoundStarting' coroutine is finished, run the 'RoundPlaying' coroutine but don't return until it's finished.
-            yield return StartCoroutine (RoundPlaying());
-
-            // Once execution has returned here, run the 'RoundEnding' coroutine, again don't return until it's finished.
-            yield return StartCoroutine (RoundEnding());
-
-            // This code is not run until 'RoundEnding' has finished.  At which point, check if a game winner has been found.
-            if (m_GameWinner != null)
-            {
-                // If there is a game winner, restart the level.
-                SceneManager.LoadScene (0);
+                m_CameraControl.m_Targets = new Transform[] { m_SpawnPoints[0].m_Instance.transform };
             }
             else
             {
-                // If there isn't a winner yet, restart this coroutine so the loop continues.
-                // Note that this coroutine doesn't yield.  This means that the current version of the GameLoop will end.
-                StartCoroutine (GameLoop ());
+                m_CameraControl.m_Targets = new Transform[0];
             }
         }
 
-
-        private IEnumerator RoundStarting ()
+        /// <summary>
+        /// Правило 4: Бесшовный бесконечный цикл открытого мира (SandboxLoop).
+        /// </summary>
+        private IEnumerator SandboxLoop()
         {
-            // As soon as the round starts reset the tanks and make sure they can't move.
-            ResetAllTanks ();
-            DisableTankControl ();
+            ResetAllTanks();
+            EnableTankControl();
 
-            // Snap the camera's zoom and position to something appropriate for the reset tanks.
-            m_CameraControl.SetStartPositionAndSize ();
-
-            // Increment the round number and display text showing the players what round it is.
-            m_RoundNumber++;
-            m_TitleText.text = "ROUND " + m_RoundNumber;
-
-            // Wait for the specified length of time until yielding control back to the game loop.
-            yield return m_StartWait;
-        }
-
-
-        private IEnumerator RoundPlaying ()
-        {
-            // As soon as the round begins playing let the players control the tanks.
-            EnableTankControl ();
-
-            // Clear the text from the screen.
-            m_TitleText.text = string.Empty;
-
-            // While there is not one tank left...
-            while (!OneTankLeft())
+            if (m_MessageText != null)
             {
-                // ... return on the next frame.
-                yield return null;
+                m_MessageText.text = string.Empty;
             }
-        }
 
+            WaitForSeconds checkInterval = new WaitForSeconds(1.0f);
 
-        private IEnumerator RoundEnding ()
-        {
-            // Stop tanks from moving.
-            DisableTankControl ();
-
-            // Clear the winner from the previous round.
-            m_RoundWinner = null;
-
-            // See if there is a winner now the round is over.
-            m_RoundWinner = GetRoundWinner ();
-
-            // If there is a winner, increment their score.
-            if (m_RoundWinner != null)
-                m_RoundWinner.m_Wins++;
-
-            // Now the winner's score has been incremented, see if someone has one the game.
-            m_GameWinner = GetGameWinner ();
-
-            // Get a message based on the scores and whether or not there is a game winner and display it.
-            string message = EndMessage ();
-            m_TitleText.text = message;
-
-            // Wait for the specified length of time until yielding control back to the game loop.
-            yield return m_EndWait;
-        }
-
-
-        // This is used to check if there is one or fewer tanks remaining and thus the round should end.
-        private bool OneTankLeft()
-        {
-            // Start the count of tanks left at zero.
-            int numTanksLeft = 0;
-
-            // Go through all the tanks...
-            for (int i = 0; i < m_PlayerCount; i++)
+            while (true)
             {
-                // ... and if they are active, increment the counter.
-                if (m_SpawnPoints[i].m_Instance.activeSelf)
-                    numTanksLeft++;
-            }
+                yield return checkInterval;
 
-            // If there are one or fewer tanks remaining return true, otherwise return false.
-            return numTanksLeft <= 1;
+                if (m_SpawnPoints == null) continue;
+
+                for (int i = 0; i < m_SpawnPoints.Length; i++)
+                {
+                    if (m_SpawnPoints[i] != null && m_SpawnPoints[i].m_Instance != null)
+                    {
+                        // Если танк уничтожен (!activeSelf) и еще не возрождается
+                        if (!m_SpawnPoints[i].m_Instance.activeSelf && !m_RespawningTanks.Contains(i))
+                        {
+                            StartCoroutine(RespawnTank(i));
+                        }
+                    }
+                }
+            }
         }
-        
-        
-        // This function is to find out if there is a winner of the round.
-        // This function is called with the assumption that 1 or fewer tanks are currently active.
-        private TankManager GetRoundWinner()
+
+        /// <summary>
+        /// Правило 4: Задержка 3 секунды, затем Reset() и EnableControl() в точке биома.
+        /// </summary>
+        private IEnumerator RespawnTank(int tankIndex)
         {
-            // Go through all the tanks...
-            for (int i = 0; i < m_PlayerCount; i++)
+            m_RespawningTanks.Add(tankIndex);
+
+            yield return new WaitForSeconds(3.0f);
+
+            if (m_SpawnPoints != null && tankIndex < m_SpawnPoints.Length && m_SpawnPoints[tankIndex] != null)
             {
-                // ... and if one of them is active, it is the winner so return it.
-                if (m_SpawnPoints[i].m_Instance.activeSelf)
-                    return m_SpawnPoints[i];
+                m_SpawnPoints[tankIndex].Reset();
+                m_SpawnPoints[tankIndex].EnableControl();
+
+                if (tankIndex == 0)
+                {
+                    SetCameraTargets();
+                }
             }
 
-            // If none of the tanks are active it is a draw so return null.
-            return null;
+            m_RespawningTanks.Remove(tankIndex);
         }
 
-
-        // This function is to find out if there is a winner of the game.
-        private TankManager GetGameWinner()
-        {
-            // Go through all the tanks...
-            for (int i = 0; i < m_PlayerCount; i++)
-            {
-                // ... and if one of them has enough rounds to win the game, return it.
-                if (m_SpawnPoints[i].m_Wins == m_NumRoundsToWin)
-                    return m_SpawnPoints[i];
-            }
-
-            // If no tanks have enough rounds to win, return null.
-            return null;
-        }
-
-
-        // Returns a string message to display at the end of each round.
-        private string EndMessage()
-        {
-            // By default when a round ends there are no winners so the default end message is a draw.
-            string message = "DRAW!";
-
-            // If there is a winner then change the message to reflect that.
-            if (m_RoundWinner != null)
-                message = m_RoundWinner.m_ColoredPlayerText + " WINS THE ROUND!";
-
-            // Add some line breaks after the initial message.
-            message += "\n\n\n\n";
-
-            // Go through all the tanks and add each of their scores to the message.
-            for (int i = 0; i < m_PlayerCount; i++)
-            {
-                message += m_SpawnPoints[i].m_ColoredPlayerText + ": " + m_SpawnPoints[i].m_Wins + " WINS\n";
-            }
-
-            // If there is a game winner, change the entire message to reflect that.
-            if (m_GameWinner != null)
-                message = m_GameWinner.m_ColoredPlayerText + " WINS THE GAME!";
-
-            return message;
-        }
-
-
-        // This function is used to turn all the tanks back on and reset their positions and properties.
         private void ResetAllTanks()
         {
-            for (int i = 0; i < m_PlayerCount; i++)
+            if (m_SpawnPoints == null) return;
+
+            for (int i = 0; i < m_SpawnPoints.Length; i++)
             {
-                m_SpawnPoints[i].Reset();
+                if (m_SpawnPoints[i] != null)
+                {
+                    m_SpawnPoints[i].Reset();
+                }
             }
         }
-
 
         private void EnableTankControl()
         {
-            for (int i = 0; i < m_PlayerCount; i++)
+            if (m_SpawnPoints == null) return;
+
+            for (int i = 0; i < m_SpawnPoints.Length; i++)
             {
-                m_SpawnPoints[i].EnableControl();
+                if (m_SpawnPoints[i] != null)
+                {
+                    m_SpawnPoints[i].EnableControl();
+                }
             }
         }
 
-
         private void DisableTankControl()
         {
-            for (int i = 0; i < m_PlayerCount; i++)
+            if (m_SpawnPoints == null) return;
+
+            for (int i = 0; i < m_SpawnPoints.Length; i++)
             {
-                m_SpawnPoints[i].DisableControl();
+                if (m_SpawnPoints[i] != null)
+                {
+                    m_SpawnPoints[i].DisableControl();
+                }
             }
         }
     }
