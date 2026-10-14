@@ -31,6 +31,7 @@ namespace Tanks.Complete
         
         private CanvasScaler m_CanvasScaler;
 
+       
         private void Awake()
         {
             // URP require stacking camera to be explicitly added to the stack on the main camera
@@ -192,16 +193,18 @@ namespace Tanks.Complete
 
             // PlayerData is a structure that allow to pass info between the menu and the GameManager
             List<GameManager.PlayerData> playerData = new List<GameManager.PlayerData>();
+            
             foreach (var slot in m_PlayerSlots)
             {
                 if (!slot.IsOpen)
                 {
                     playerData.Add(new GameManager.PlayerData()
                     {
-                        TankColor = slot.m_SlotColor,
+//                        TankColor = slot.m_SlotColor,
                         IsComputer = slot.IsComputer,
                         ControlIndex = slot.PlayerControlling,
-                        UsedPrefab = slot.TankPrefab,
+  //                      UsedPrefab = slot.TankPrefab,
+
                     });
                 }
             }
