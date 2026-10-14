@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 21916af07e754774baa508caf181a2c2
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 46209
+  packageName: Tanks! | 3D Sample Project
+  packageVersion: 4.1
+  assetPath: Assets/_Tanks/Prefabs/PowerUps/Healing.prefab
+  uploadId: 1012748
